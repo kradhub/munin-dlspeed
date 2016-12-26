@@ -1,0 +1,130 @@
+#!/bin/sh
+# -*- sh -*-
+
+: << =cut
+
+=head1 NAME
+
+dlspeed - Plugin to monitor the download speed of a file
+
+=head1 CONFIGURATION
+
+The following environment variables are used by this plugin:
+
+=over 4
+
+=item url <url>
+
+URL of the file to download
+
+=item timeout <int>
+
+Timeout in seconds to stop download (default: 30)
+
+=item cache_timeout <int>
+
+Cache timeout of the speed value. If 0, cache is disabled (default=3600)
+
+=back
+
+=head2 EXAMPLE CONFIGURATION
+
+ [dlspeed]
+  env.url http://mywebsite.net/myfile
+
+ [dlspeed]
+  env.url http://mywebsite.net/myfile
+  env.timeout 10
+  env.cache_timeout 7200
+
+=head1 NOTES
+
+To avoid loading network interfaces each time munin fetch data (5 min), plugin
+have an internal cache system which can be configured with the 'cache_timeout'
+parameter. It doesn't use the 'update_rate' of munin as it seems to not works
+well (graph is not displayed).
+
+=head1 AUTHOR
+
+Copyright (C) 2016 Aurélien Zanelli <aurelien.zanelli@darkosphere.fr>
+
+=head1 LICENSE
+
+GPLv2. See COPYING file.
+
+=cut
+
+# make sure we have some default values for some user defined variable
+timeout=${timeout:-30}
+cache_timeout=${cache_timeout:-3600}
+
+cache_file="${MUNIN_PLUGSTATE}/dlspeed.state"
+
+get_monotonic () {
+	sed -n -e 's/.*now at \([0-9]\+\).*/\1/p' /proc/timer_list
+}
+
+case $1 in
+	config)
+		cat <<'EOM'
+graph_title Download speed
+graph_vlabel speed
+graph_args --base 1000 -l 0
+graph_info Network download speed.
+graph_category network
+speed.label speed
+speed.info Network speed in bytes
+EOM
+		exit 0;;
+esac
+
+if [ -z ${url} ]; then
+	echo "No url set" >&2
+	exit 1
+fi
+
+do_download="true"
+if [ ${cache_timeout} -gt 0 ]; then
+	now=$(get_monotonic)
+
+	if [ -f ${cache_file} ]; then
+		timestamp=$(cut -d ' ' -f 1 ${cache_file})
+		diff=$(echo "(${now} - ${timestamp}) / 1000 / 1000 / 1000" | bc)
+
+		if [ ${diff} -lt ${cache_timeout} ]; then
+			dlspeed=$(cut -d ' ' -f 2 ${cache_file})
+			do_download="false"
+		fi
+	fi
+fi
+
+if [ "${do_download}" = "true" ]; then
+	wget_logfile=$(mktemp)
+
+	# Download file and get the second to last file downloaded offset after
+	# timeout as the last line could be truncated
+	timeout ${timeout} wget -O /dev/null ${url} -o ${wget_logfile}
+	dlsize=$(tail -n 2 ${wget_logfile} | head -n 1 | sed -e 's/^\s*\([0-9]\+\)\([KMG]\).*/\1 \2/')
+	rm ${wget_logfile}
+
+	# compute average download speed
+	xbytes="$(echo "${dlsize}" | cut -d ' ' -f 1)"
+	unit="$(echo "${dlsize}" | cut -d ' ' -f 2)"
+
+	if [ "$unit" = "K" ]; then
+		factor="1000";
+	elif [ "$unit" = "M" ]; then
+		factor="1000*1000";
+	elif [ "$unit" = "G" ]; then
+		factor="1000*1000*1000";
+	else
+		factor="1";
+	fi
+
+	dlspeed=$(echo "${xbytes} * ${factor} / ${timeout}" | bc)
+	if [ ${cache_timeout} -gt 0 ]; then
+		echo "$(get_monotonic) ${dlspeed}" > ${cache_file}
+	fi
+fi
+
+echo "speed.value ${dlspeed}"
